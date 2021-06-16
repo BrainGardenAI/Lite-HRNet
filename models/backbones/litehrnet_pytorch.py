@@ -1,52 +1,73 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mmcv.cnn import (ConvModule, DepthwiseSeparableConvModule,
-                      build_conv_layer, build_norm_layer, constant_init,
-                      normal_init)
-from torch.nn.modules.batchnorm import _BatchNorm
 import torch.utils.checkpoint as cp
+from torch.nn.modules.batchnorm import _BatchNorm
 
-import mmcv
-from mmpose.utils import get_root_logger
-# from mmpose.models.registry import BACKBONES
-from mmpose.models.builder import BACKBONES # FIX
-from mmpose.models.backbones.resnet import BasicBlock, Bottleneck
-from mmpose.models.backbones.utils import load_checkpoint, channel_shuffle
 
+def channel_shuffle(x, groups):
+    """Channel Shuffle operation.
+
+    This function enables cross-group information flow for multiple groups
+    convolution layers.
+
+    Args:
+        x (Tensor): The input tensor.
+        groups (int): The number of groups to divide the input tensor
+            in the channel dimension.
+
+    Returns:
+        Tensor: The output tensor after channel shuffle operation.
+    """
+
+    batch_size, num_channels, height, width = x.size()
+    assert (num_channels % groups == 0), ('num_channels should be '
+                                          'divisible by groups')
+    channels_per_group = num_channels // groups
+
+    x = x.view(batch_size, groups, channels_per_group, height, width)
+    x = torch.transpose(x, 1, 2).contiguous()
+    x = x.view(batch_size, -1, height, width)
+
+    return x
+
+def normal_init(module, mean=0, std=1, bias=0):
+    if hasattr(module, 'weight') and module.weight is not None:
+        nn.init.normal_(module.weight, mean, std)
+    if hasattr(module, 'bias') and module.bias is not None:
+        nn.init.constant_(module.bias, bias)
+
+def constant_init(module, val, bias=0):
+    if hasattr(module, 'weight') and module.weight is not None:
+        nn.init.constant_(module.weight, val)
+    if hasattr(module, 'bias') and module.bias is not None:
+        nn.init.constant_(module.bias, bias)
 
 class SpatialWeighting(nn.Module):
 
     def __init__(self,
                  channels,
-                 ratio=16,
-                 conv_cfg=None,
-                 act_cfg=(dict(type='ReLU'), dict(type='Sigmoid'))):
+                 ratio=16):
         super().__init__()
-        if isinstance(act_cfg, dict):
-            act_cfg = (act_cfg, act_cfg)
-        assert len(act_cfg) == 2
-        assert mmcv.is_tuple_of(act_cfg, dict)
+        out_channels = int(channels / ratio)
         self.global_avgpool = nn.AdaptiveAvgPool2d(1)
-        self.conv1 = ConvModule(
-            in_channels=channels,
-            out_channels=int(channels / ratio),
-            kernel_size=1,
-            stride=1,
-            conv_cfg=conv_cfg,
-            act_cfg=act_cfg[0])
-        self.conv2 = ConvModule(
-            in_channels=int(channels / ratio),
-            out_channels=channels,
-            kernel_size=1,
-            stride=1,
-            conv_cfg=conv_cfg,
-            act_cfg=act_cfg[1])
+        self.conv1 = nn.Conv2d(in_channels=channels,
+                               out_channels=out_channels,
+                               kernel_size=1,
+                               stride=1,
+                               padding=0)
+        self.conv2 = nn.Conv2d(in_channels=out_channels,
+                               out_channels=channels,
+                               kernel_size=1,
+                               stride=1,
+                               padding=0)
 
     def forward(self, x):
         out = self.global_avgpool(x)
         out = self.conv1(out)
+        out = F.relu(out)
         out = self.conv2(out)
+        out = torch.sigmoid(out)
         return x * out
 
 
@@ -54,56 +75,47 @@ class CrossResolutionWeighting(nn.Module):
 
     def __init__(self,
                  channels,
-                 ratio=16,
-                 conv_cfg=None,
-                 norm_cfg=None,
-                 act_cfg=(dict(type='ReLU'), dict(type='Sigmoid'))):
+                 ratio=16):
         super().__init__()
-        if isinstance(act_cfg, dict):
-            act_cfg = (act_cfg, act_cfg)
-        assert len(act_cfg) == 2
-        assert mmcv.is_tuple_of(act_cfg, dict)
         self.channels = channels
         total_channel = sum(channels)
-        self.conv1 = ConvModule(
-            in_channels=total_channel,
-            out_channels=int(total_channel / ratio),
-            kernel_size=1,
-            stride=1,
-            conv_cfg=conv_cfg,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg[0])
-        self.conv2 = ConvModule(
-            in_channels=int(total_channel / ratio),
-            out_channels=total_channel,
-            kernel_size=1,
-            stride=1,
-            conv_cfg=conv_cfg,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg[1])
+        out_channels = int(total_channel / ratio)
+        self.conv1 = nn.Conv2d(in_channels=total_channel,
+                               out_channels=out_channels,
+                               kernel_size=1,
+                               stride=1,
+                               padding=0)
+        self.conv2 = nn.Conv2d(in_channels=out_channels,
+                               out_channels=total_channel,
+                               kernel_size=1,
+                               stride=1,
+                               padding=0)
+
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.BatchNorm2d(total_channel)
 
     def forward(self, x):
         mini_size = x[-1].size()[-2:]
         out = [F.adaptive_avg_pool2d(s, mini_size) for s in x[:-1]] + [x[-1]]
         out = torch.cat(out, dim=1)
         out = self.conv1(out)
+        out = self.bn1(out)
+        out = F.relu(out)
         out = self.conv2(out)
+        out = self.bn2(out)
+        out = torch.sigmoid(out)
         out = torch.split(out, self.channels, dim=1)
-        out = [
-            s * F.interpolate(a, size=s.size()[-2:], mode='nearest')
-            for s, a in zip(x, out)
-        ]
+        out = [s * F.interpolate(a, size=s.size()[-2:], mode='nearest')
+               for s, a in zip(x, out)]
         return out
 
-
+# RAD here
 class ConditionalChannelWeighting(nn.Module):
 
     def __init__(self,
                  in_channels,
                  stride,
                  reduce_ratio,
-                 conv_cfg=None,
-                 norm_cfg=dict(type='BN'),
                  with_cp=False):
         super().__init__()
         self.with_cp = with_cp
@@ -114,21 +126,17 @@ class ConditionalChannelWeighting(nn.Module):
 
         self.cross_resolution_weighting = CrossResolutionWeighting(
             branch_channels,
-            ratio=reduce_ratio,
-            conv_cfg=conv_cfg,
-            norm_cfg=norm_cfg)
+            ratio=reduce_ratio)
 
         self.depthwise_convs = nn.ModuleList([
-            ConvModule(
-                channel,
-                channel,
-                kernel_size=3,
-                stride=self.stride,
-                padding=1,
-                groups=channel,
-                conv_cfg=conv_cfg,
-                norm_cfg=norm_cfg,
-                act_cfg=None) for channel in branch_channels
+            nn.Sequential(nn.Conv2d(in_channels=channel,
+                                    out_channels=channel,
+                                    kernel_size=3,
+                                    stride=self.stride,
+                                    padding=1,
+                                    groups=channel),
+                          nn.BatchNorm2d(channel))
+            for channel in branch_channels
         ])
 
         self.spatial_weighting = nn.ModuleList([
@@ -167,25 +175,18 @@ class Stem(nn.Module):
                  stem_channels,
                  out_channels,
                  expand_ratio,
-                 conv_cfg=None,
-                 norm_cfg=dict(type='BN'),
                  with_cp=False):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.conv_cfg = conv_cfg
-        self.norm_cfg = norm_cfg
         self.with_cp = with_cp
 
-        self.conv1 = ConvModule(
-            in_channels=in_channels,
-            out_channels=stem_channels,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-            conv_cfg=self.conv_cfg,
-            norm_cfg=self.norm_cfg,
-            act_cfg=dict(type='ReLU'))
+        self.conv1 = nn.Conv2d(in_channels=in_channels,
+                               out_channels=stem_channels,
+                               kernel_size=3,
+                               stride=2,
+                               padding=1)
+        self.bn1 = nn.BatchNorm2d(stem_channels)
 
         mid_channels = int(round(stem_channels * expand_ratio))
         branch_channels = stem_channels // 2
@@ -195,66 +196,64 @@ class Stem(nn.Module):
             inc_channels = self.out_channels - stem_channels
 
         self.branch1 = nn.Sequential(
-            ConvModule(
-                branch_channels,
-                branch_channels,
-                kernel_size=3,
-                stride=2,
-                padding=1,
-                groups=branch_channels,
-                conv_cfg=conv_cfg,
-                norm_cfg=norm_cfg,
-                act_cfg=None),
-            ConvModule(
-                branch_channels,
-                inc_channels,
-                kernel_size=1,
-                stride=1,
-                padding=0,
-                conv_cfg=conv_cfg,
-                norm_cfg=norm_cfg,
-                act_cfg=dict(type='ReLU')),
+            nn.Conv2d(in_channels=branch_channels,
+                      out_channels=branch_channels,
+                      kernel_size=3,
+                      stride=2,
+                      padding=1,
+                      groups=branch_channels),
+            nn.BatchNorm2d(branch_channels),
+            nn.Conv2d(in_channels=branch_channels,
+                      out_channels=inc_channels,
+                      kernel_size=1,
+                      stride=1,
+                      padding=0),
+            nn.BatchNorm2d(inc_channels),
+            nn.ReLU()
         )
 
-        self.expand_conv = ConvModule(
-            branch_channels,
-            mid_channels,
-            kernel_size=1,
-            stride=1,
-            padding=0,
-            conv_cfg=conv_cfg,
-            norm_cfg=norm_cfg,
-            act_cfg=dict(type='ReLU'))
-        self.depthwise_conv = ConvModule(
-            mid_channels,
-            mid_channels,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-            groups=mid_channels,
-            conv_cfg=conv_cfg,
-            norm_cfg=norm_cfg,
-            act_cfg=None)
-        self.linear_conv = ConvModule(
-            mid_channels,
-            branch_channels
-            if stem_channels == self.out_channels else stem_channels,
-            kernel_size=1,
-            stride=1,
-            padding=0,
-            conv_cfg=conv_cfg,
-            norm_cfg=norm_cfg,
-            act_cfg=dict(type='ReLU'))
+        self.expand_conv = nn.Conv2d(in_channels=branch_channels,
+                                     out_channels=mid_channels,
+                                     kernel_size=1,
+                                     stride=1,
+                                     padding=0)
+        self.expand_bn = nn.BatchNorm2d(mid_channels)
+
+        self.depthwise_conv = nn.Conv2d(in_channels=mid_channels,
+                                        out_channels=mid_channels,
+                                        kernel_size=3,
+                                        stride=2,
+                                        padding=1,
+                                        groups=mid_channels)
+        self.depthwise_bn = nn.BatchNorm2d(mid_channels)
+
+        out_channels = branch_channels if stem_channels == self.out_channels else stem_channels
+        self.linear_conv = nn.Conv2d(in_channels=mid_channels,
+                                        out_channels=out_channels,
+                                        kernel_size=1,
+                                        stride=1,
+                                        padding=0)
+        self.linear_bn = nn.BatchNorm2d(out_channels)
 
     def forward(self, x):
 
         def _inner_forward(x):
             x = self.conv1(x)
+            x = self.bn1(x)
+            x = F.relu(x)
+
             x1, x2 = x.chunk(2, dim=1)
 
             x2 = self.expand_conv(x2)
+            x2 = self.expand_bn(x2)
+            x2 = F.relu(x2)
+
             x2 = self.depthwise_conv(x2)
+            x2 = self.depthwise_bn(x2)
+
             x2 = self.linear_conv(x2)
+            x2 = self.linear_bn(x2)
+            x2 = F.relu(x2)
 
             out = torch.cat((self.branch1(x1), x2), dim=1)
 
@@ -269,62 +268,7 @@ class Stem(nn.Module):
 
         return out
 
-
-class IterativeHead(nn.Module):
-
-    def __init__(self, in_channels, conv_cfg=None, norm_cfg=dict(type='BN')):
-        super().__init__()
-        projects = []
-        num_branchs = len(in_channels)
-        self.in_channels = in_channels[::-1]
-
-        for i in range(num_branchs):
-            if i != num_branchs - 1:
-                projects.append(
-                    DepthwiseSeparableConvModule(
-                        in_channels=self.in_channels[i],
-                        out_channels=self.in_channels[i + 1],
-                        kernel_size=3,
-                        stride=1,
-                        padding=1,
-                        norm_cfg=norm_cfg,
-                        act_cfg=dict(type='ReLU'),
-                        dw_act_cfg=None,
-                        pw_act_cfg=dict(type='ReLU')))
-            else:
-                projects.append(
-                    DepthwiseSeparableConvModule(
-                        in_channels=self.in_channels[i],
-                        out_channels=self.in_channels[i],
-                        kernel_size=3,
-                        stride=1,
-                        padding=1,
-                        norm_cfg=norm_cfg,
-                        act_cfg=dict(type='ReLU'),
-                        dw_act_cfg=None,
-                        pw_act_cfg=dict(type='ReLU')))
-        self.projects = nn.ModuleList(projects)
-
-    def forward(self, x):
-        x = x[::-1]
-
-        y = []
-        last_x = None
-        for i, s in enumerate(x):
-            if last_x is not None:
-                last_x = F.interpolate(
-                    last_x,
-                    size=s.size()[-2:],
-                    mode='bilinear',
-                    align_corners=True)
-                s = s + last_x
-            s = self.projects[i](s)
-            y.append(s)
-            last_x = s
-
-        return y[::-1]
-
-
+# RAD here
 class ShuffleUnit(nn.Module):
     """InvertedResidual block for ShuffleNetV2 backbone.
 
@@ -346,9 +290,6 @@ class ShuffleUnit(nn.Module):
                  in_channels,
                  out_channels,
                  stride=1,
-                 conv_cfg=None,
-                 norm_cfg=dict(type='BN'),
-                 act_cfg=dict(type='ReLU'),
                  with_cp=False):
         super().__init__()
         self.stride = stride
@@ -368,56 +309,42 @@ class ShuffleUnit(nn.Module):
 
         if self.stride > 1:
             self.branch1 = nn.Sequential(
-                ConvModule(
-                    in_channels,
-                    in_channels,
-                    kernel_size=3,
-                    stride=self.stride,
-                    padding=1,
-                    groups=in_channels,
-                    conv_cfg=conv_cfg,
-                    norm_cfg=norm_cfg,
-                    act_cfg=None),
-                ConvModule(
-                    in_channels,
-                    branch_features,
-                    kernel_size=1,
-                    stride=1,
-                    padding=0,
-                    conv_cfg=conv_cfg,
-                    norm_cfg=norm_cfg,
-                    act_cfg=act_cfg),
+                nn.Conv2d(in_channels=in_channels,
+                          out_channels=in_channels,
+                          kernel_size=3,
+                          stride=self.stride,
+                          padding=1),
+                nn.BatchNorm2d(in_channels),
+                nn.Conv2d(in_channels=in_channels,
+                          out_channels=branch_features,
+                          kernel_size=1,
+                          stride=1,
+                          padding=0),
+                nn.ReLU()
             )
 
         self.branch2 = nn.Sequential(
-            ConvModule(
-                in_channels if (self.stride > 1) else branch_features,
-                branch_features,
-                kernel_size=1,
-                stride=1,
-                padding=0,
-                conv_cfg=conv_cfg,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg),
-            ConvModule(
-                branch_features,
-                branch_features,
-                kernel_size=3,
-                stride=self.stride,
-                padding=1,
-                groups=branch_features,
-                conv_cfg=conv_cfg,
-                norm_cfg=norm_cfg,
-                act_cfg=None),
-            ConvModule(
-                branch_features,
-                branch_features,
-                kernel_size=1,
-                stride=1,
-                padding=0,
-                conv_cfg=conv_cfg,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg))
+            nn.Conv2d(in_channels=in_channels if (self.stride > 1) else branch_features,
+                      out_channels=branch_features,
+                      kernel_size=1,
+                      stride=1,
+                      padding=0),
+            nn.BatchNorm2d(in_channels),
+            nn.Conv2d(in_channels=branch_features,
+                      out_channels=branch_features,
+                      kernel_size=3,
+                      stride=self.stride,
+                      padding=1,
+                      groups=branch_features),
+            nn.BatchNorm2d(in_channels),
+            nn.Conv2d(in_channels=branch_features,
+                      out_channels=branch_features,
+                      kernel_size=1,
+                      stride=1,
+                      padding=0),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU()
+        )
 
     def forward(self, x):
 
@@ -491,8 +418,6 @@ class LiteHRModule(nn.Module):
                     self.in_channels,
                     stride=stride,
                     reduce_ratio=reduce_ratio,
-                    conv_cfg=self.conv_cfg,
-                    norm_cfg=self.norm_cfg,
                     with_cp=self.with_cp))
 
         return nn.Sequential(*layers)
@@ -505,9 +430,6 @@ class LiteHRModule(nn.Module):
                 self.in_channels[branch_index],
                 self.in_channels[branch_index],
                 stride=stride,
-                conv_cfg=self.conv_cfg,
-                norm_cfg=self.norm_cfg,
-                act_cfg=dict(type='ReLU'),
                 with_cp=self.with_cp))
         for i in range(1, num_blocks):
             layers.append(
@@ -515,9 +437,6 @@ class LiteHRModule(nn.Module):
                     self.in_channels[branch_index],
                     self.in_channels[branch_index],
                     stride=1,
-                    conv_cfg=self.conv_cfg,
-                    norm_cfg=self.norm_cfg,
-                    act_cfg=dict(type='ReLU'),
                     with_cp=self.with_cp))
 
         return nn.Sequential(*layers)
@@ -546,17 +465,14 @@ class LiteHRModule(nn.Module):
                 if j > i:
                     fuse_layer.append(
                         nn.Sequential(
-                            build_conv_layer(
-                                self.conv_cfg,
-                                in_channels[j],
-                                in_channels[i],
-                                kernel_size=1,
-                                stride=1,
-                                padding=0,
-                                bias=False),
-                            build_norm_layer(self.norm_cfg, in_channels[i])[1],
-                            nn.Upsample(
-                                scale_factor=2**(j - i), mode='nearest')))
+                            nn.Conv2d(in_channels=in_channels[j],
+                                      out_channels=in_channels[i],
+                                      kernel_size=1,
+                                      stride=1,
+                                      padding=0,
+                                      bias=False),
+                            nn.BatchNorm2d(in_channels[i]),
+                            nn.Upsample(scale_factor=2**(j - i), mode='nearest')))
                 elif j == i:
                     fuse_layer.append(None)
                 else:
@@ -565,51 +481,39 @@ class LiteHRModule(nn.Module):
                         if k == i - j - 1:
                             conv_downsamples.append(
                                 nn.Sequential(
-                                    build_conv_layer(
-                                        self.conv_cfg,
-                                        in_channels[j],
-                                        in_channels[j],
-                                        kernel_size=3,
-                                        stride=2,
-                                        padding=1,
-                                        groups=in_channels[j],
-                                        bias=False),
-                                    build_norm_layer(self.norm_cfg,
-                                                     in_channels[j])[1],
-                                    build_conv_layer(
-                                        self.conv_cfg,
-                                        in_channels[j],
-                                        in_channels[i],
-                                        kernel_size=1,
-                                        stride=1,
-                                        padding=0,
-                                        bias=False),
-                                    build_norm_layer(self.norm_cfg,
-                                                     in_channels[i])[1]))
+                                    nn.Conv2d(in_channels=in_channels[j],
+                                              out_channels=in_channels[j],
+                                              kernel_size=3,
+                                              stride=2,
+                                              padding=1,
+                                              groups=in_channels[j],
+                                              bias=False),
+                                    nn.BatchNorm2d(in_channels[j]),
+                                    nn.Conv2d(in_channels=in_channels[j],
+                                              out_channels=in_channels[i],
+                                              kernel_size=1,
+                                              stride=1,
+                                              padding=0,
+                                              bias=False),
+                                    nn.BatchNorm2d(in_channels[i])))
                         else:
                             conv_downsamples.append(
                                 nn.Sequential(
-                                    build_conv_layer(
-                                        self.conv_cfg,
-                                        in_channels[j],
-                                        in_channels[j],
-                                        kernel_size=3,
-                                        stride=2,
-                                        padding=1,
-                                        groups=in_channels[j],
-                                        bias=False),
-                                    build_norm_layer(self.norm_cfg,
-                                                     in_channels[j])[1],
-                                    build_conv_layer(
-                                        self.conv_cfg,
-                                        in_channels[j],
-                                        in_channels[j],
-                                        kernel_size=1,
-                                        stride=1,
-                                        padding=0,
-                                        bias=False),
-                                    build_norm_layer(self.norm_cfg,
-                                                     in_channels[j])[1],
+                                    nn.Conv2d(in_channels=in_channels[j],
+                                              out_channels=in_channels[j],
+                                              kernel_size=3,
+                                              stride=2,
+                                              padding=1,
+                                              groups=in_channels[j],
+                                              bias=False),
+                                    nn.BatchNorm2d(in_channels[j]),
+                                    nn.Conv2d(in_channels=in_channels[j],
+                                              out_channels=in_channels[j],
+                                              kernel_size=1,
+                                              stride=1,
+                                              padding=0,
+                                              bias=False),
+                                    nn.BatchNorm2d(in_channels[j]),
                                     nn.ReLU(inplace=True)))
                     fuse_layer.append(nn.Sequential(*conv_downsamples))
             fuse_layers.append(nn.ModuleList(fuse_layer))
@@ -644,8 +548,7 @@ class LiteHRModule(nn.Module):
         return out
 
 
-@BACKBONES.register_module()
-class LiteHRNet(nn.Module):
+class LiteHRNet_pytorch(nn.Module):
     """Lite-HRNet backbone.
 
     `High-Resolution Representations for Labeling Pixels and Regions
@@ -707,26 +610,19 @@ class LiteHRNet(nn.Module):
     def __init__(self,
                  extra,
                  in_channels=3,
-                 conv_cfg=None,
-                 norm_cfg=dict(type='BN'),
                  norm_eval=False,
                  with_cp=False,
                  zero_init_residual=False):
         super().__init__()
         self.extra = extra
-        self.conv_cfg = conv_cfg
-        self.norm_cfg = norm_cfg
         self.norm_eval = norm_eval
         self.with_cp = with_cp
-        self.zero_init_residual = zero_init_residual
 
         self.stem = Stem(
             in_channels,
             stem_channels=self.extra['stem']['stem_channels'],
             out_channels=self.extra['stem']['out_channels'],
-            expand_ratio=self.extra['stem']['expand_ratio'],
-            conv_cfg=self.conv_cfg,
-            norm_cfg=self.norm_cfg)
+            expand_ratio=self.extra['stem']['expand_ratio'])
 
         self.num_stages = self.extra['num_stages']
         self.stages_spec = self.extra['stages_spec']
@@ -745,13 +641,11 @@ class LiteHRNet(nn.Module):
                 self.stages_spec, i, num_channels, multiscale_output=True)
             setattr(self, 'stage{}'.format(i), stage)
 
-        self.with_head = self.extra['with_head']
+        self.with_head = self.extra['with_segment_head']
         if self.with_head:
-            self.head_layer = IterativeHead(
-                in_channels=num_channels_last,
-                conv_cfg=self.conv_cfg,
-                norm_cfg=self.norm_cfg,
-            )
+            # TODO
+            pass
+
 
     def _make_transition_layer(self, num_channels_pre_layer,
                                num_channels_cur_layer):
@@ -765,27 +659,21 @@ class LiteHRNet(nn.Module):
                 if num_channels_cur_layer[i] != num_channels_pre_layer[i]:
                     transition_layers.append(
                         nn.Sequential(
-                            build_conv_layer(
-                                self.conv_cfg,
-                                num_channels_pre_layer[i],
-                                num_channels_pre_layer[i],
-                                kernel_size=3,
-                                stride=1,
-                                padding=1,
-                                groups=num_channels_pre_layer[i],
-                                bias=False),
-                            build_norm_layer(self.norm_cfg,
-                                             num_channels_pre_layer[i])[1],
-                            build_conv_layer(
-                                self.conv_cfg,
-                                num_channels_pre_layer[i],
-                                num_channels_cur_layer[i],
-                                kernel_size=1,
-                                stride=1,
-                                padding=0,
-                                bias=False),
-                            build_norm_layer(self.norm_cfg,
-                                             num_channels_cur_layer[i])[1],
+                            nn.Conv2d(in_channels=num_channels_pre_layer[i],
+                                      out_channels=num_channels_pre_layer[i],
+                                      kernel_size=3,
+                                      stride=1,
+                                      padding=1,
+                                      groups=num_channels_pre_layer[i],
+                                      bias=False),
+                            nn.BatchNorm2d(num_channels_pre_layer[i]),
+                            nn.Conv2d(in_channels=num_channels_pre_layer[i],
+                                      out_channels=num_channels_cur_layer[i],
+                                      kernel_size=1,
+                                      stride=1,
+                                      padding=0,
+                                      bias=False),
+                            nn.BatchNorm2d(num_channels_cur_layer[i]),
                             nn.ReLU()))
                 else:
                     transition_layers.append(None)
@@ -797,25 +685,21 @@ class LiteHRNet(nn.Module):
                         if j == i - num_branches_pre else in_channels
                     conv_downsamples.append(
                         nn.Sequential(
-                            build_conv_layer(
-                                self.conv_cfg,
-                                in_channels,
-                                in_channels,
-                                kernel_size=3,
-                                stride=2,
-                                padding=1,
-                                groups=in_channels,
-                                bias=False),
-                            build_norm_layer(self.norm_cfg, in_channels)[1],
-                            build_conv_layer(
-                                self.conv_cfg,
-                                in_channels,
-                                out_channels,
-                                kernel_size=1,
-                                stride=1,
-                                padding=0,
-                                bias=False),
-                            build_norm_layer(self.norm_cfg, out_channels)[1],
+                            nn.Conv2d(in_channels=in_channels,
+                                      out_channels=in_channels,
+                                      kernel_size=3,
+                                      stride=2,
+                                      padding=1,
+                                      groups=in_channels,
+                                      bias=False),
+                            nn.BatchNorm2d(in_channels),
+                            nn.Conv2d(in_channels=in_channels,
+                                      out_channels=out_channels,
+                                      kernel_size=1,
+                                      stride=1,
+                                      padding=0,
+                                      bias=False),
+                            nn.BatchNorm2d(out_channels),
                             nn.ReLU()))
                 transition_layers.append(nn.Sequential(*conv_downsamples))
 
@@ -850,8 +734,6 @@ class LiteHRNet(nn.Module):
                     module_type,
                     multiscale_output=reset_multiscale_output,
                     with_fuse=with_fuse,
-                    conv_cfg=self.conv_cfg,
-                    norm_cfg=self.norm_cfg,
                     with_cp=self.with_cp))
             in_channels = modules[-1].in_channels
 
@@ -865,8 +747,7 @@ class LiteHRNet(nn.Module):
                 Defaults to None.
         """
         if isinstance(pretrained, str):
-            logger = get_root_logger()
-            load_checkpoint(self, pretrained, strict=False, logger=logger)
+            self.load_state_dict(torch.load(pretrained), strict=False)
         elif pretrained is None:
             for m in self.modules():
                 if isinstance(m, nn.Conv2d):
@@ -874,12 +755,6 @@ class LiteHRNet(nn.Module):
                 elif isinstance(m, (_BatchNorm, nn.GroupNorm)):
                     constant_init(m, 1)
 
-            if self.zero_init_residual:
-                for m in self.modules():
-                    if isinstance(m, Bottleneck):
-                        constant_init(m.norm3, 0)
-                    elif isinstance(m, BasicBlock):
-                        constant_init(m.norm2, 0)
         else:
             raise TypeError('pretrained must be a str or None')
 
@@ -903,7 +778,9 @@ class LiteHRNet(nn.Module):
 
         x = y_list
         if self.with_head:
-            x = self.head_layer(x)
+            # TODO
+            pass
+            #x = self.head_layer(x)
 
         return [x[0]]
 

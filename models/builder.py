@@ -1,7 +1,8 @@
 from mmcv.utils import build_from_cfg
 from torch import nn
 
-from mmpose.models.registry import BACKBONES, HEADS, LOSSES, NECKS, POSENETS
+# from mmpose.models.registry import BACKBONES, HEADS, LOSSES, NECKS, POSENETS # FIX
+from mmpose.models.builder import BACKBONES, HEADS, LOSSES, NECKS, POSENETS
 
 
 def build(cfg, registry, default_args=None):
